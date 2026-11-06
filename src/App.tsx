@@ -11,6 +11,73 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "./lib/utils";
+import JSZip from "jszip";
+
+const triggerBlobDownload = (blob: Blob, filename: string) => {
+  const downloadUrl = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = downloadUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(downloadUrl);
+};
+
+const convertPdfClientSide = async (
+  file: File,
+  onProgress?: (current: number, total: number) => void
+): Promise<Blob> => {
+  const pdfjs = (window as any).pdfjsLib;
+  if (!pdfjs) {
+    throw new Error("PDF processing engine is still initializing. Please try again in a few seconds.");
+  }
+  pdfjs.GlobalWorkerOptions.workerSrc = "";
+
+  const arrayBuffer = await file.arrayBuffer();
+  const doc = await pdfjs.getDocument({
+    data: arrayBuffer,
+    disableAutoFetch: true,
+    disableStream: true,
+  }).promise;
+
+  const numPages = doc.numPages;
+  const zip = new JSZip();
+
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+
+  for (let i = 1; i <= numPages; i++) {
+    if (onProgress) {
+      onProgress(i, numPages);
+    }
+    const page = await doc.getPage(i);
+    const unscaledViewport = page.getViewport({ scale: 1.0 });
+    const maxDim = Math.max(unscaledViewport.width, unscaledViewport.height);
+    const scale = maxDim > 2500 ? 1.0 : (maxDim > 1400 ? 1.5 : 2.0);
+    const viewport = page.getViewport({ scale });
+
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+
+    await page.render({
+      canvasContext: context!,
+      viewport,
+    }).promise;
+
+    const dataUrl = canvas.toDataURL("image/png");
+    zip.file(`page-${i}.png`, dataUrl.split(",")[1], { base64: true });
+
+    page.cleanup();
+    context!.clearRect(0, 0, canvas.width, canvas.height);
+  }
+
+  return await zip.generateAsync({
+    type: "blob",
+    compression: "DEFLATE",
+    compressionOptions: { level: 6 },
+  });
+};
 
 type ConversionType = "url" | "html" | "word" | "pdf";
 type ExportFormat = "pdf" | "image";
@@ -153,8 +220,26 @@ export default function App() {
     try {
       setIsConverting(true);
       setErrorDesc(null);
-      
+
+      const formatToSend: ExportFormat = conversionType === "pdf" ? "image" : exportFormat;
+      const fileBaseName =
+        conversionType === "url"
+          ? "webpage"
+          : selectedFile?.name.replace(/\.[^/.]+$/, "") || "document";
+
+      // If it's a PDF conversion and the file exceeds 20 MB:
+      // In Cloud Run environments, request payloads are capped at 32 MB.
+      // A 20MB+ PDF becomes >27MB base64 JSON, triggering 413 (Content Too Large).
+      // We convert large PDFs directly client-side with PDF.js and JSZip with zero network upload!
+      if (conversionType === "pdf" && selectedFile && selectedFile.size > 20 * 1024 * 1024) {
+        const zipBlob = await convertPdfClientSide(selectedFile);
+        triggerBlobDownload(zipBlob, `${fileBaseName}-images.zip`);
+        return;
+      }
+
       let payload = trimmedUrl;
+      let uploadId: string | undefined = undefined;
+
       if (conversionType === "html") {
         payload = await selectedFile!.text();
       } else if (conversionType === "word" || conversionType === "pdf") {
@@ -163,10 +248,33 @@ export default function App() {
           reader.onload = () => resolve(reader.result as string);
           reader.readAsDataURL(selectedFile!);
         });
-        payload = dataUrl.split(',')[1];
-      }
+        payload = dataUrl.split(",")[1];
 
-      const formatToSend: ExportFormat = conversionType === "pdf" ? "image" : exportFormat;
+        // If payload is over 15 MB, upload in 10 MB chunks to easily fit Cloud Run's 32 MB limit
+        if (payload.length > 15 * 1024 * 1024) {
+          const chunkSize = 10 * 1024 * 1024;
+          const totalChunks = Math.ceil(payload.length / chunkSize);
+          uploadId = `upload-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+          for (let i = 0; i < totalChunks; i++) {
+            const chunkData = payload.slice(i * chunkSize, (i + 1) * chunkSize);
+            const chunkRes = await fetch("/api/upload/chunk", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                uploadId,
+                chunkIndex: i,
+                totalChunks,
+                data: chunkData,
+              }),
+            });
+            if (!chunkRes.ok) {
+              throw new Error("Failed to upload file chunk");
+            }
+          }
+          payload = "";
+        }
+      }
 
       const response = await fetch("/api/convert", {
         method: "POST",
@@ -176,27 +284,27 @@ export default function App() {
         body: JSON.stringify({
           type: conversionType,
           payload,
-          format: formatToSend
+          uploadId,
+          format: formatToSend,
         }),
       });
 
       if (!response.ok) {
+        // If the server proxy returns 413 (Content Too Large) and it's a PDF, fall back seamlessly to client-side conversion
+        if (response.status === 413 && conversionType === "pdf" && selectedFile) {
+          const zipBlob = await convertPdfClientSide(selectedFile);
+          triggerBlobDownload(zipBlob, `${fileBaseName}-images.zip`);
+          return;
+        }
+
         const errorData = await response.json().catch(() => null);
         throw new Error(errorData?.error || "Failed to convert file");
       }
 
       const blob = await response.blob();
-      const downloadUrl = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = downloadUrl;
-      
-      const fileBaseName = conversionType === "url" ? "webpage" : (selectedFile?.name.replace(/\.[^/.]+$/, "") || "document");
-      a.download = formatToSend === "image" ? `${fileBaseName}-images.zip` : `${fileBaseName}.pdf`;
-      
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(downloadUrl);
+      const downloadFilename =
+        formatToSend === "image" ? `${fileBaseName}-images.zip` : `${fileBaseName}.pdf`;
+      triggerBlobDownload(blob, downloadFilename);
     } catch (err: any) {
       setErrorDesc(err.message || "An unexpected error occurred.");
     } finally {

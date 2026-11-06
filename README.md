@@ -19,9 +19,6 @@ A Vite + React document conversion UI backed by an Express server. The app conve
 │   └── support/
 │       └── step_definitions/
 │           └── converter.ts    # Step definitions and API stubs for feature tests
-├── app/
-│   └── applet/
-│       └── test-arch.ts        # Local archiver import probe
 ├── cypress.config.ts           # Cypress + Cucumber preprocessor config
 ├── .cypress-cucumber-preprocessorrc.json
 ├── vite.config.ts              # Vite and React plugin config
